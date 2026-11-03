@@ -1,0 +1,6 @@
+{
+  "name": "AURELLE — Premium Women's Fashion",
+  "description": "Her Style. Her Story. Discover high-end ethnic wear, designer sarees, contemporary kurtis, luxury jewellery, nightwear, and fragrance for women in India.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
