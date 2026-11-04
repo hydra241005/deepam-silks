@@ -420,14 +420,17 @@ export const deleteAdminCategory = async (categoryId: string) => {
 };
 
 export const getStoreSettings = async (): Promise<StoreSettingsRecord> => {
-  const { data, error } = await requireSupabase().from('store_settings').select('*').eq('id', true).single();
+  await requireAdmin();
+  const { data, error } = await requireSupabase().rpc('get_admin_store_settings');
   if (error) throw error;
+  const settings = Array.isArray(data) ? data[0] : data;
+  if (!settings) throw new Error('Store settings could not be loaded.');
   return {
-    storeName: data.store_name, contactEmail: data.contact_email, contactPhone: data.contact_phone,
-    supportEmail: data.support_email, supportPhone: data.support_phone, currency: data.currency,
-    freeDeliveryThreshold: minorUnitsToDisplay(data.free_delivery_threshold_minor),
-    deliveryFee: minorUnitsToDisplay(data.delivery_fee_minor), announcement: data.announcement,
-    notifications: data.notifications,
+    storeName: settings.store_name, contactEmail: settings.contact_email, contactPhone: settings.contact_phone,
+    supportEmail: settings.support_email, supportPhone: settings.support_phone, currency: settings.currency,
+    freeDeliveryThreshold: minorUnitsToDisplay(settings.free_delivery_threshold_minor),
+    deliveryFee: minorUnitsToDisplay(settings.delivery_fee_minor), announcement: settings.announcement,
+    notifications: settings.notifications,
   };
 };
 
