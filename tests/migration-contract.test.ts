@@ -12,6 +12,14 @@ const codOnlyMigration = readFileSync(new URL(
   '../supabase/migrations/20261103183000_cod_only_payments.sql',
   import.meta.url,
 ), 'utf8');
+const rpcPrivilegeMigration = readFileSync(new URL(
+  '../supabase/migrations/20261109120000_restrict_commerce_rpc_execution.sql',
+  import.meta.url,
+), 'utf8');
+const colorValidationMigration = readFileSync(new URL(
+  '../supabase/migrations/20261124173217_validate_order_item_color.sql',
+  import.meta.url,
+), 'utf8');
 
 test('migration rejects malformed orders and serializes inventory reservations', () => {
   assert.match(migration, /p_items is null/);
@@ -128,4 +136,55 @@ test('migration scopes privilege changes and handles optional signup phones safe
   assert.match(migration, /else null/);
   assert.match(migration, /product-images bucket exists but is private/);
   assert.match(migration, /if not v_public then/);
+});
+
+test('service-only commerce RPCs are not executable by API roles', () => {
+  const serviceOnlyFunctions = [
+    'release_order_reservations(uuid, text)',
+    'process_razorpay_event(uuid, text, text, text, bigint, text)',
+    'mark_payment_event_retry(uuid, text)',
+    'release_expired_reservations()',
+    'reset_stale_payment_attempts()',
+  ];
+
+  for (const signature of serviceOnlyFunctions) {
+    assert.ok(rpcPrivilegeMigration.includes(
+      `revoke all on function public.${signature} from public, anon, authenticated;`,
+    ));
+    assert.ok(rpcPrivilegeMigration.includes(
+      `grant execute on function public.${signature} to service_role;`,
+    ));
+  }
+});
+
+test('authenticated commerce RPCs explicitly exclude anonymous callers', () => {
+  const authenticatedFunctions = [
+    'create_order(uuid, text, jsonb, jsonb, text)',
+    'cancel_order(uuid)',
+    'create_admin_product(jsonb, jsonb)',
+    'update_order_fulfillment_status(uuid, public.fulfillment_status)',
+  ];
+
+  for (const signature of authenticatedFunctions) {
+    assert.ok(rpcPrivilegeMigration.includes(
+      `revoke all on function public.${signature} from public, anon;`,
+    ));
+    assert.ok(rpcPrivilegeMigration.includes(
+      `grant execute on function public.${signature} to authenticated;`,
+    ));
+  }
+});
+
+test('order item colors must match the selected product variant', () => {
+  const createOrderFunction = readFileSync(new URL(
+    '../supabase/functions/create-order/index.ts',
+    import.meta.url,
+  ), 'utf8');
+  assert.match(colorValidationMigration, /create or replace function public\.validate_order_item_color/);
+  assert.match(colorValidationMigration, /security invoker/);
+  assert.match(colorValidationMigration, /where pv\.id = new\.variant_id[\s\S]*and pv\.product_id = new\.product_id/);
+  assert.match(colorValidationMigration, /new\.color_name is distinct from v_variant_color/);
+  assert.match(colorValidationMigration, /raise exception 'color does not match variant'/);
+  assert.match(colorValidationMigration, /before insert or update on public\.order_items/);
+  assert.match(createOrderFunction, /'color does not match variant'/);
 });
