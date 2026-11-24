@@ -18,8 +18,24 @@ import {
   Sparkles,
   MapPin
 } from 'lucide-react';
-import { ProductColor, ProductVariant } from '../types';
-import { getEffectiveProductPrice, getPublishedProducts } from '../lib/backend';
+import { Product, ProductColor, ProductVariant } from '../types';
+import { getEffectiveProductPrice, getPublishedProducts, type EffectiveProductPrice } from '../lib/backend';
+import { MAX_CART_QUANTITY } from '../lib/cart';
+import { resolveProductDetail } from '../lib/product-detail';
+import { getProductPriceDisplay } from '../lib/pricing';
+import { getVariantColorLabel, variantSupportsColor } from '../lib/cart';
+
+const DEFAULT_PRODUCT_COLOR: ProductColor = { name: 'Default', hex: '#e5e5e5' };
+
+const getDefaultVariant = (product: Product): ProductVariant | null =>
+  product.variants.find(variant => variant.inStock) ?? product.variants[0] ?? null;
+
+const getColorForVariant = (product: Product, variant: ProductVariant | null): ProductColor => {
+  const variantColorName = variant ? getVariantColorLabel(variant) : null;
+  return (variantColorName
+    ? product.colors.find(color => color.name === variantColorName)
+    : product.colors[0]) ?? product.colors[0] ?? DEFAULT_PRODUCT_COLOR;
+};
 
 export const ProductDetailPage: React.FC = () => {
   const { 
@@ -29,21 +45,46 @@ export const ProductDetailPage: React.FC = () => {
     addToCart, 
     toggleWishlist, 
     isInWishlist,
-    addToast 
+    addToast,
+    variantStock,
+    variantStockStatus,
+    cartValidationState,
+    cartValidationError,
   } = useShop();
 
-  const [catalog, setCatalog] = useState(PRODUCTS);
-  React.useEffect(() => { getPublishedProducts().then(setCatalog).catch(() => undefined); }, []);
-  const product = catalog.find(p => p.id === selectedProductId) || PRODUCTS[0];
+  const [catalog, setCatalog] = useState<typeof PRODUCTS>([]);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [catalogError, setCatalogError] = useState(false);
+  React.useEffect(() => {
+    let active = true;
+    getPublishedProducts().then(products => {
+      if (active) setCatalog(products);
+    }).catch(error => {
+      console.error('Product availability could not be loaded', error);
+      if (active) setCatalogError(true);
+    }).finally(() => {
+      if (active) setCatalogLoading(false);
+    });
+    return () => { active = false; };
+  }, []);
+  const resolution = resolveProductDetail(
+    selectedProductId,
+    catalog,
+    catalogLoading ? 'loading' : catalogError ? 'error' : 'ready',
+  );
+  const product = resolution.status === 'ready' ? resolution.product : PRODUCTS[0];
   const categoryMeta = CATEGORIES.find(c => c.id === product.category);
 
   // States
   const [selectedImage, setSelectedImage] = useState(product.primaryImage);
-  const [selectedColor, setSelectedColor] = useState<ProductColor>(product.colors[0]);
-  const [selectedVariant, setSelectedVariant] = useState<ProductVariant>(
-    product.variants.find(v => v.inStock) || product.variants[0]
+  const [selectedVariant, setSelectedVariant] = useState<ProductVariant | null>(
+    getDefaultVariant(product)
+  );
+  const [selectedColor, setSelectedColor] = useState<ProductColor>(
+    getColorForVariant(product, getDefaultVariant(product))
   );
   const [quantity, setQuantity] = useState(1);
+  const [isAdding, setIsAdding] = useState(false);
   const [pinCode, setPinCode] = useState('');
   const [deliveryStatus, setDeliveryStatus] = useState<{
     tested: boolean;
@@ -52,31 +93,71 @@ export const ProductDetailPage: React.FC = () => {
   }>({ tested: false });
   const [showSizeGuide, setShowSizeGuide] = useState(false);
   const [openAccordion, setOpenAccordion] = useState<'desc' | 'care' | 'shipping' | null>('desc');
-  const [effectivePrice, setEffectivePrice] = useState<{ regular: number; sale: number; discount: number } | null>(null);
+  const [effectivePrice, setEffectivePrice] = useState<EffectiveProductPrice | null>(null);
 
   React.useEffect(() => {
     let active = true;
+    if (resolution.status !== 'ready') {
+      setEffectivePrice(null);
+      return () => { active = false; };
+    }
     getEffectiveProductPrice(product.id).then(price => {
-      if (active && price) setEffectivePrice({
-        regular: price.regularPriceMinor / 100,
-        sale: price.effectivePriceMinor / 100,
-        discount: price.discountMinor,
-      });
+      if (active) setEffectivePrice(price);
     }).catch(() => undefined);
     return () => { active = false; };
-  }, [product.id]);
+  }, [product.id, resolution.status]);
 
   // Reset states when product changes
   React.useEffect(() => {
+    const defaultVariant = getDefaultVariant(product);
     setSelectedImage(product.primaryImage);
-    setSelectedColor(product.colors[0]);
-    setSelectedVariant(product.variants.find(v => v.inStock) || product.variants[0]);
+    setSelectedColor(getColorForVariant(product, defaultVariant));
+    setSelectedVariant(defaultVariant);
     setQuantity(1);
     setDeliveryStatus({ tested: false });
-  }, [product.id]);
+  }, [product]);
+
+  const selectedStockStatus = selectedVariant
+    ? variantStockStatus.get(selectedVariant.id)
+    : undefined;
+  const availableQuantity = selectedVariant
+    ? variantStock.get(selectedVariant.id) ?? selectedVariant.availableQuantity
+    : undefined;
+  const safeQuantity = availableQuantity && availableQuantity > 0
+    ? Math.min(quantity, availableQuantity, MAX_CART_QUANTITY)
+    : 1;
+  const canAttemptAdd = Boolean(
+    selectedVariant &&
+    resolution.status === 'ready' &&
+    availableQuantity !== undefined &&
+    availableQuantity > 0 &&
+    !catalogLoading &&
+    !catalogError &&
+    cartValidationState === 'ready' &&
+    selectedStockStatus !== 'loading' &&
+    !isAdding
+  );
+
+  React.useEffect(() => {
+    if (availableQuantity !== undefined) {
+      setQuantity(current => availableQuantity > 0
+        ? Math.max(1, Math.min(current, availableQuantity, MAX_CART_QUANTITY))
+        : 1);
+    }
+  }, [selectedVariant?.id, availableQuantity]);
+
+  const handleAddToCart = async () => {
+    if (!selectedVariant || !canAttemptAdd) return;
+    setIsAdding(true);
+    try {
+      await addToCart(product, selectedColor, selectedVariant, safeQuantity);
+    } finally {
+      setIsAdding(false);
+    }
+  };
 
   const isSaved = isInWishlist(product.id);
-  const displayRegularPrice = effectivePrice?.discount ? effectivePrice.regular : product.originalPrice;
+  const priceDisplay = getProductPriceDisplay(product, effectivePrice);
 
   // Check Indian PIN code
   const handleCheckPinCode = (e: React.FormEvent) => {
@@ -105,9 +186,43 @@ export const ProductDetailPage: React.FC = () => {
   };
 
   // Related products from the same category
-  const relatedProducts = PRODUCTS.filter(
+  const relatedProducts = catalog.filter(
     p => p.category === product.category && p.id !== product.id
   ).slice(0, 4);
+
+  if (resolution.status !== 'ready') {
+    const message = resolution.status === 'loading'
+      ? 'Loading product details…'
+      : resolution.status === 'catalog-error'
+        ? 'We could not verify this product’s availability. Please try again later.'
+        : resolution.status === 'unavailable'
+          ? 'This product is currently unavailable.'
+          : 'This product could not be found. It may have been unpublished or is no longer available.';
+    const title = resolution.status === 'loading'
+      ? 'Loading product'
+      : resolution.status === 'catalog-error'
+        ? 'Product unavailable'
+        : resolution.status === 'unavailable'
+          ? 'Product unavailable'
+          : 'Product not found';
+
+    return (
+      <main className="min-h-screen bg-white flex items-center justify-center px-4">
+        <section className="max-w-lg text-center" role={resolution.status === 'loading' ? 'status' : 'alert'}>
+          <h1 className="font-display text-2xl text-neutral-900">{title}</h1>
+          <p className="mt-3 text-sm text-neutral-600">{message}</p>
+          {resolution.status !== 'loading' && (
+            <button
+              onClick={navigateToHome}
+              className="mt-6 px-6 py-3 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-wider"
+            >
+              Return to Home
+            </button>
+          )}
+        </section>
+      </main>
+    );
+  }
 
   return (
     <div className="bg-white min-h-screen">
@@ -232,16 +347,16 @@ export const ProductDetailPage: React.FC = () => {
             <div className="p-4 bg-neutral-50 border border-neutral-200/80">
               <div className="flex items-baseline gap-3">
                 <span className="font-mono text-2xl font-bold text-neutral-950 tabular-nums">
-                  ₹{(effectivePrice?.sale ?? product.price).toLocaleString('en-IN')}
+                  ₹{(priceDisplay.priceMinor / 100).toLocaleString('en-IN')}
                 </span>
-                {displayRegularPrice && (
+                {priceDisplay.compareAtMinor !== null && (
                   <span className="font-mono text-sm text-neutral-400 line-through tabular-nums">
-                    ₹{displayRegularPrice.toLocaleString('en-IN')}
+                    ₹{(priceDisplay.compareAtMinor / 100).toLocaleString('en-IN')}
                   </span>
                 )}
-                {(effectivePrice?.discount ? Math.round((effectivePrice.discount / (effectivePrice.regular * 100)) * 100) : product.discountPercent) && (
+                {priceDisplay.discountPercent !== null && (
                   <span className="text-xs font-semibold text-rose-700 uppercase tracking-wider">
-                    Save {effectivePrice?.discount ? Math.round((effectivePrice.discount / (effectivePrice.regular * 100)) * 100) : product.discountPercent}%
+                    Save {priceDisplay.discountPercent}%
                   </span>
                 )}
               </div>
@@ -262,7 +377,17 @@ export const ProductDetailPage: React.FC = () => {
                   {product.colors.map(color => (
                     <button
                       key={color.name}
-                      onClick={() => setSelectedColor(color)}
+                      onClick={() => {
+                        const matchingVariants = product.variants.filter(variant =>
+                          variantSupportsColor(variant, color.name)
+                        );
+                        setSelectedColor(color);
+                        setSelectedVariant(
+                          matchingVariants.find(variant => variant.inStock) ??
+                          matchingVariants[0] ??
+                          null
+                        );
+                      }}
                       className={`w-6 h-6 rounded-full border transition-all ${
                         selectedColor.name === color.name
                           ? 'ring-2 ring-neutral-950 scale-110 border-white'
@@ -299,13 +424,26 @@ export const ProductDetailPage: React.FC = () => {
               </div>
 
               <div className="flex flex-wrap gap-2">
-                {product.variants.map(variant => {
-                  const isSelected = selectedVariant.id === variant.id;
+                {product.variants.filter(variant =>
+                  variantSupportsColor(variant, selectedColor.name)
+                ).map(variant => {
+                  const isSelected = selectedVariant?.id === variant.id;
                   return (
                     <button
                       key={variant.id}
                       disabled={!variant.inStock}
-                      onClick={() => setSelectedVariant(variant)}
+                      onClick={() => {
+                        setSelectedVariant(variant);
+                        const variantColorName = getVariantColorLabel(variant);
+                        if (variantColorName) {
+                          const matchingColor = product.colors.find(color =>
+                            color.name === variantColorName
+                          );
+                          if (matchingColor) setSelectedColor(matchingColor);
+                        }
+                        const stock = variantStock.get(variant.id) ?? variant.availableQuantity;
+                        setQuantity(stock && stock > 0 ? Math.min(quantity, stock, MAX_CART_QUANTITY) : 1);
+                      }}
                       className={`px-4 py-2.5 text-xs font-mono tracking-wider border transition-all ${
                         !variant.inStock
                           ? 'border-neutral-200 text-neutral-300 line-through cursor-not-allowed bg-neutral-50'
@@ -323,23 +461,37 @@ export const ProductDetailPage: React.FC = () => {
 
             {/* Quantity Stepper & Add to Bag CTA */}
             <div className="space-y-3 pt-2">
+              <p className="text-xs text-neutral-500" aria-live="polite">
+                {cartValidationState === 'error'
+                  ? cartValidationError
+                  : catalogLoading || selectedStockStatus === 'loading'
+                  ? 'Checking availability…'
+                  : catalogError || selectedStockStatus === 'error'
+                    ? 'Availability could not be verified.'
+                    : availableQuantity === undefined
+                      ? 'Availability could not be verified.'
+                      : availableQuantity === 0
+                        ? 'Out of stock'
+                        : `${availableQuantity} available`}
+              </p>
               <div className="flex items-center gap-3">
                 {/* Quantity */}
                 <div className="flex items-center border border-neutral-300 bg-white h-12 px-3">
                   <button
-                    onClick={() => setQuantity(Math.max(1, quantity - 1))}
-                    disabled={quantity <= 1}
+                    onClick={() => setQuantity(Math.max(1, safeQuantity - 1))}
+                    disabled={safeQuantity <= 1}
                     className="text-neutral-500 hover:text-black disabled:opacity-30 p-1 text-sm font-mono"
                     aria-label="Decrease quantity"
                   >
                     -
                   </button>
                   <span className="w-8 text-center text-xs font-mono font-semibold tabular-nums">
-                    {quantity}
+                    {safeQuantity}
                   </span>
                   <button
-                    onClick={() => setQuantity(quantity + 1)}
-                    className="text-neutral-500 hover:text-black p-1 text-sm font-mono"
+                    onClick={() => setQuantity(Math.min(safeQuantity + 1, availableQuantity ?? 0, MAX_CART_QUANTITY))}
+                    disabled={!availableQuantity || quantity >= availableQuantity || quantity >= MAX_CART_QUANTITY || selectedStockStatus === 'loading' || selectedStockStatus === 'error'}
+                    className="text-neutral-500 hover:text-black disabled:opacity-30 p-1 text-sm font-mono"
                     aria-label="Increase quantity"
                   >
                     +
@@ -348,11 +500,12 @@ export const ProductDetailPage: React.FC = () => {
 
                 {/* Primary Add to Bag Button */}
                 <button
-                  onClick={() => addToCart(product, selectedColor, selectedVariant, quantity)}
-                  className="flex-1 h-12 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-[0.18em] hover:bg-neutral-800 transition-colors flex items-center justify-center gap-2 shadow-sm"
+                  onClick={handleAddToCart}
+                  disabled={!canAttemptAdd}
+                  className="flex-1 h-12 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-[0.18em] hover:bg-neutral-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2 shadow-sm"
                 >
                   <ShoppingBag className="w-4 h-4" />
-                  ADD TO SHOPPING BAG
+                  {isAdding ? 'VERIFYING STOCK…' : selectedStockStatus === 'error' ? 'RETRY STOCK CHECK' : 'ADD TO SHOPPING BAG'}
                 </button>
 
                 {/* Wishlist Toggle Button */}
@@ -570,15 +723,16 @@ export const ProductDetailPage: React.FC = () => {
         <div>
           <span className="text-[10px] text-neutral-500 uppercase block font-mono">Total</span>
           <span className="text-base font-bold font-mono text-neutral-950">
-            ₹{(effectivePrice?.sale ?? product.price).toLocaleString('en-IN')}
+            ₹{(priceDisplay.priceMinor / 100).toLocaleString('en-IN')}
           </span>
         </div>
         <button
-          onClick={() => addToCart(product, selectedColor, selectedVariant, quantity)}
-          className="flex-1 py-3 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-wider flex items-center justify-center gap-2"
+          onClick={handleAddToCart}
+          disabled={!canAttemptAdd}
+          className="flex-1 py-3 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-wider disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
         >
           <ShoppingBag className="w-4 h-4" />
-          Add to Bag
+          {isAdding ? 'VERIFYING STOCK…' : selectedStockStatus === 'error' ? 'Retry Stock Check' : 'Add to Bag'}
         </button>
       </div>
 

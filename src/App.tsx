@@ -8,6 +8,7 @@ import { ProductDetailPage } from './components/ProductDetailPage';
 import { WishlistView } from './components/WishlistView';
 import { OrderConfirmationView } from './components/OrderConfirmationView';
 import { LoginPage } from './components/LoginPage';
+import { ResetPasswordPage } from './components/ResetPasswordPage';
 import { SignupPage } from './components/SignupPage';
 import { AdminDashboard } from './admin/AdminDashboard';
 import { CartDrawer } from './components/CartDrawer';
@@ -16,9 +17,19 @@ import { SearchModal } from './components/SearchModal';
 import { AccountModal } from './components/AccountModal';
 import { ToastContainer } from './components/ToastContainer';
 import { Footer } from './components/Footer';
+import { isResetPasswordPath } from './lib/password-recovery';
 
 const MainContent: React.FC = () => {
   const { currentView, isAdmin, isAuthLoading } = useShop();
+
+  if (isResetPasswordPath(window.location.pathname)) {
+    return (
+      <div className="min-h-screen bg-white text-neutral-900 font-sans">
+        <ResetPasswordPage />
+        <ToastContainer />
+      </div>
+    );
+  }
 
   // Admin dashboard — completely separate full-screen layout
   if (currentView === 'admin') {

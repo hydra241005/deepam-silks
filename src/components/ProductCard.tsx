@@ -3,7 +3,9 @@ import { Heart, ShoppingBag, Check } from 'lucide-react';
 import { Product, ProductColor, ProductVariant } from '../types';
 import { useShop } from '../context/ShopContext';
 import { ImageWithFallback } from './ImageWithFallback';
-import { getEffectiveProductPrice } from '../lib/backend';
+import { getEffectiveProductPrice, type EffectiveProductPrice } from '../lib/backend';
+import { getProductPriceDisplay } from '../lib/pricing';
+import { getVariantColorLabel, variantSupportsColor } from '../lib/cart';
 
 interface ProductCardProps {
   product: Product;
@@ -11,31 +13,48 @@ interface ProductCardProps {
 
 export const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
   const { navigateToProduct, addToCart, toggleWishlist, isInWishlist } = useShop();
-  const [selectedColor, setSelectedColor] = useState<ProductColor>(product.colors[0]);
+  const defaultVariant = product.variants.find(variant => variant.inStock) ?? product.variants[0] ?? null;
+  const defaultColorName = defaultVariant ? getVariantColorLabel(defaultVariant) : null;
+  const [selectedColor, setSelectedColor] = useState<ProductColor>(
+    (defaultColorName
+      ? product.colors.find(color => color.name === defaultColorName)
+      : product.colors[0]) ?? product.colors[0] ?? { name: 'Default', hex: '#e5e5e5' }
+  );
   const [isHovered, setIsHovered] = useState(false);
   const [showQuickAdd, setShowQuickAdd] = useState(false);
-  const [selectedVariant, setSelectedVariant] = useState<ProductVariant>(
-    product.variants.find(v => v.inStock) || product.variants[0]
+  const [selectedVariant, setSelectedVariant] = useState<ProductVariant | null>(
+    defaultVariant
   );
-  const [effectivePrice, setEffectivePrice] = useState<{ regular: number; sale: number; discount: number } | null>(null);
+  const [effectivePrice, setEffectivePrice] = useState<EffectiveProductPrice | null>(null);
 
   useEffect(() => {
     let active = true;
     getEffectiveProductPrice(product.id).then(price => {
       if (active && price) setEffectivePrice({
-        regular: price.regularPriceMinor / 100,
-        sale: price.effectivePriceMinor / 100,
-        discount: price.discountMinor,
+        ...price,
       });
     }).catch(() => undefined);
     return () => { active = false; };
   }, [product.id]);
 
+  useEffect(() => {
+    const variant = product.variants.find(item => item.inStock) ?? product.variants[0] ?? null;
+    const colorName = variant ? getVariantColorLabel(variant) : null;
+    setSelectedVariant(variant);
+    setSelectedColor((colorName
+      ? product.colors.find(color => color.name === colorName)
+      : product.colors[0]) ?? product.colors[0] ?? { name: 'Default', hex: '#e5e5e5' });
+  }, [product]);
+
   const isSaved = isInWishlist(product.id);
-  const displayRegularPrice = effectivePrice?.discount ? effectivePrice.regular : product.originalPrice;
+  const priceDisplay = getProductPriceDisplay(product, effectivePrice);
+  const variantsForSelectedColor = product.variants.filter(variant =>
+    variantSupportsColor(variant, selectedColor.name)
+  );
 
   const handleQuickAdd = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (!selectedVariant) return;
     if (product.variants.length > 1) {
       setShowQuickAdd(true);
     } else {
@@ -111,7 +130,7 @@ export const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
                 Select {product.variantType === 'size' ? 'Size' : 'Option'}:
               </div>
               <div className="flex flex-wrap gap-1.5">
-                {product.variants.map(variant => (
+                {variantsForSelectedColor.map(variant => (
                   <button
                     key={variant.id}
                     disabled={!variant.inStock}
@@ -119,7 +138,7 @@ export const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
                     className={`px-2 py-1 text-xs border font-mono transition-colors ${
                       !variant.inStock
                         ? 'border-neutral-200 text-neutral-300 line-through cursor-not-allowed'
-                        : selectedVariant.id === variant.id
+                        : selectedVariant?.id === variant.id
                         ? 'border-neutral-900 bg-neutral-900 text-white'
                         : 'border-neutral-300 text-neutral-800 hover:border-neutral-900'
                     }`}
@@ -142,6 +161,14 @@ export const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
               onClick={(e) => {
                 e.stopPropagation();
                 setSelectedColor(color);
+                const matchingVariants = product.variants.filter(variant =>
+                  variantSupportsColor(variant, color.name)
+                );
+                setSelectedVariant(
+                  matchingVariants.find(variant => variant.inStock) ??
+                  matchingVariants[0] ??
+                  null
+                );
               }}
               className={`w-3.5 h-3.5 rounded-full border transition-transform ${
                 selectedColor.name === color.name
@@ -172,16 +199,16 @@ export const ProductCard: React.FC<ProductCardProps> = ({ product }) => {
       {/* Price Block */}
       <div className="flex items-baseline gap-2 mt-1.5 font-mono">
         <span className="text-sm font-semibold text-neutral-950 tabular-nums">
-          ₹{(effectivePrice?.sale ?? product.price).toLocaleString('en-IN')}
+          ₹{(priceDisplay.priceMinor / 100).toLocaleString('en-IN')}
         </span>
-        {displayRegularPrice && (
+        {priceDisplay.compareAtMinor !== null && (
           <span className="text-xs text-neutral-400 line-through tabular-nums">
-            ₹{displayRegularPrice.toLocaleString('en-IN')}
+            ₹{(priceDisplay.compareAtMinor / 100).toLocaleString('en-IN')}
           </span>
         )}
-        {(effectivePrice?.discount ? Math.round((effectivePrice.discount / (effectivePrice.regular * 100)) * 100) : product.discountPercent) && (
+        {priceDisplay.discountPercent !== null && (
           <span className="text-[11px] font-sans font-medium text-rose-700">
-            {effectivePrice?.discount ? Math.round((effectivePrice.discount / (effectivePrice.regular * 100)) * 100) : product.discountPercent}% OFF
+            {priceDisplay.discountPercent}% OFF
           </span>
         )}
       </div>

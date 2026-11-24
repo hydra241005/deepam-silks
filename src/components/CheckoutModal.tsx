@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useReducer, useRef, useState } from 'react';
 import { useShop } from '../context/ShopContext';
 import { 
   X, 
@@ -8,8 +8,14 @@ import {
   ArrowRight,
   ArrowLeft
 } from 'lucide-react';
-import { ShippingAddress } from '../types';
 import { openRazorpayCheckout } from '../lib/backend';
+import {
+  beginCheckoutOperation,
+  checkoutModalReducer,
+  createInitialCheckoutModalState,
+  invalidateCheckoutOperation,
+  isCurrentCheckoutOperation,
+} from '../lib/checkout-modal';
 
 export const CheckoutModal: React.FC = () => {
   const { 
@@ -20,25 +26,55 @@ export const CheckoutModal: React.FC = () => {
     cartDiscount, 
     cartShipping, 
     cartTotal,
+    addresses,
     placeOrder,
     completeOrder,
   } = useShop();
 
-  const [step, setStep] = useState<1 | 2>(1);
-  const [formData, setFormData] = useState<ShippingAddress>({
-    fullName: '',
-    phone: '',
-    email: '',
-    pinCode: '',
-    addressLine1: '',
-    addressLine2: '',
-    city: '',
-    state: 'Karnataka'
-  });
-
+  const [state, dispatch] = useReducer(checkoutModalReducer, createInitialCheckoutModalState());
+  const { step, formData, errors, isSubmitting } = state;
+  const operationEpochRef = useRef({ current: 0 });
+  const initializedAddressRef = useRef(false);
   const [paymentMethod] = useState<'cod'>('cod');
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [selectedAddressId, setSelectedAddressId] = useState('');
+
+  useEffect(() => {
+    if (!isCheckoutOpen) {
+      invalidateCheckoutOperation(operationEpochRef.current);
+      dispatch({ type: 'reset' });
+      setSelectedAddressId('');
+      initializedAddressRef.current = false;
+    }
+  }, [isCheckoutOpen]);
+
+  useEffect(() => {
+    if (!isCheckoutOpen || initializedAddressRef.current || addresses.length === 0) return;
+    initializedAddressRef.current = true;
+    if (formData.fullName || formData.addressLine1) return;
+    const address = addresses.find(item => item.isDefault);
+    if (!address) return;
+
+    setSelectedAddressId(address.id);
+    dispatch({
+      type: 'set-form-data',
+      formData: {
+        fullName: address.fullName,
+        phone: address.phone,
+        email: address.email,
+        pinCode: address.pinCode,
+        addressLine1: address.addressLine1,
+        addressLine2: address.addressLine2,
+        city: address.city,
+        state: address.state,
+      },
+    });
+  }, [addresses, isCheckoutOpen]);
+
+  const closeCheckout = () => {
+    invalidateCheckoutOperation(operationEpochRef.current);
+    dispatch({ type: 'reset' });
+    setIsCheckoutOpen(false);
+  };
 
   if (!isCheckoutOpen) return null;
 
@@ -57,37 +93,54 @@ export const CheckoutModal: React.FC = () => {
     if (!formData.addressLine1.trim()) errs.addressLine1 = 'Street address is required.';
     if (!formData.city.trim()) errs.city = 'City is required.';
 
-    setErrors(errs);
+    dispatch({ type: 'set-errors', errors: errs });
     return Object.keys(errs).length === 0;
   };
 
   const handleNext = (e: React.FormEvent) => {
     e.preventDefault();
     if (validateStep1()) {
-      setStep(2);
+      dispatch({ type: 'set-step', step: 2 });
     }
   };
 
   const handleCompleteOrder = async () => {
-    setIsSubmitting(true);
-    setErrors({});
+    if (isSubmitting) return;
+    const operation = beginCheckoutOperation(operationEpochRef.current);
+    dispatch({ type: 'set-submitting', isSubmitting: true });
+    dispatch({ type: 'set-errors', errors: {} });
     try {
       const result = await placeOrder(formData, paymentMethod);
+      if (!isCurrentCheckoutOperation(operationEpochRef.current, operation)) return;
       if (result.payment) {
         await openRazorpayCheckout(
           result.payment,
-          () => completeOrder(result.order),
-          () => setErrors({ form: 'Payment was not completed. Your reservation will expire automatically if you do not retry.' }),
+          () => {
+            if (!isCurrentCheckoutOperation(operationEpochRef.current, operation)) return;
+            invalidateCheckoutOperation(operationEpochRef.current);
+            completeOrder(result.order);
+          },
+          () => {
+            if (isCurrentCheckoutOperation(operationEpochRef.current, operation)) {
+              dispatch({ type: 'set-errors', errors: { form: 'Payment was not completed. Your reservation will expire automatically if you do not retry.' } });
+            }
+          },
         );
       } else {
+        invalidateCheckoutOperation(operationEpochRef.current);
         completeOrder(result.order);
       }
     } catch (error) {
-      setErrors({
-        form: error instanceof Error ? error.message : 'Checkout could not be completed securely.',
-      });
+      if (isCurrentCheckoutOperation(operationEpochRef.current, operation)) {
+        dispatch({
+          type: 'set-errors',
+          errors: { form: error instanceof Error ? error.message : 'Checkout could not be completed securely.' },
+        });
+      }
     } finally {
-      setIsSubmitting(false);
+      if (isCurrentCheckoutOperation(operationEpochRef.current, operation)) {
+        dispatch({ type: 'set-submitting', isSubmitting: false });
+      }
     }
   };
 
@@ -96,7 +149,7 @@ export const CheckoutModal: React.FC = () => {
       {/* Backdrop */}
       <div
         className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity"
-        onClick={() => setIsCheckoutOpen(false)}
+        onClick={closeCheckout}
       />
 
       <div className="flex min-h-full items-center justify-center p-4">
@@ -113,7 +166,7 @@ export const CheckoutModal: React.FC = () => {
               </h2>
             </div>
             <button
-              onClick={() => setIsCheckoutOpen(false)}
+              onClick={closeCheckout}
               className="p-1 text-neutral-400 hover:text-black"
               aria-label="Close checkout"
             >
@@ -127,6 +180,47 @@ export const CheckoutModal: React.FC = () => {
             {/* STEP 1: Address Details */}
             {step === 1 && (
               <form onSubmit={handleNext} className="space-y-4">
+                {addresses.length > 0 && (
+                  <div>
+                    <label htmlFor="checkout-saved-address" className="block text-xs font-semibold uppercase tracking-wider text-neutral-800 mb-1">
+                      Saved delivery address
+                    </label>
+                    <select
+                      id="checkout-saved-address"
+                      value={selectedAddressId}
+                      onChange={event => {
+                        const addressId = event.target.value;
+                        setSelectedAddressId(addressId);
+                        const address = addresses.find(item => item.id === addressId);
+                        if (!address) {
+                          dispatch({ type: 'set-form-data', formData: createInitialCheckoutModalState().formData });
+                          return;
+                        }
+                        dispatch({
+                          type: 'set-form-data',
+                          formData: {
+                            fullName: address.fullName,
+                            phone: address.phone,
+                            email: address.email,
+                            pinCode: address.pinCode,
+                            addressLine1: address.addressLine1,
+                            addressLine2: address.addressLine2,
+                            city: address.city,
+                            state: address.state,
+                          },
+                        });
+                      }}
+                      className="w-full px-3 py-2.5 text-xs border border-neutral-300 bg-white focus:outline-none focus:border-black"
+                    >
+                      <option value="">Enter a new address</option>
+                      {addresses.map(address => (
+                        <option key={address.id} value={address.id}>
+                          {address.addressLine1}, {address.city}{address.isDefault ? ' (Primary)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-semibold uppercase tracking-wider text-neutral-800 mb-1">
@@ -135,7 +229,7 @@ export const CheckoutModal: React.FC = () => {
                     <input
                       type="text"
                       value={formData.fullName}
-                      onChange={e => setFormData({ ...formData, fullName: e.target.value })}
+                      onChange={e => dispatch({ type: 'set-field', field: 'fullName', value: e.target.value })}
                       placeholder="e.g. Ananya Sharma"
                       className="w-full px-3 py-2.5 text-xs border border-neutral-300 focus:outline-none focus:border-black"
                     />
@@ -150,7 +244,7 @@ export const CheckoutModal: React.FC = () => {
                       type="tel"
                       maxLength={10}
                       value={formData.phone}
-                      onChange={e => setFormData({ ...formData, phone: e.target.value.replace(/\D/g, '') })}
+                      onChange={e => dispatch({ type: 'set-field', field: 'phone', value: e.target.value.replace(/\D/g, '') })}
                       placeholder="10-digit mobile number"
                       className="w-full px-3 py-2.5 text-xs border border-neutral-300 font-mono focus:outline-none focus:border-black"
                     />
@@ -165,7 +259,7 @@ export const CheckoutModal: React.FC = () => {
                   <input
                     type="email"
                     value={formData.email}
-                    onChange={e => setFormData({ ...formData, email: e.target.value })}
+                    onChange={e => dispatch({ type: 'set-field', field: 'email', value: e.target.value })}
                     placeholder="name@example.com"
                     className="w-full px-3 py-2.5 text-xs border border-neutral-300 focus:outline-none focus:border-black"
                   />
@@ -181,7 +275,7 @@ export const CheckoutModal: React.FC = () => {
                       type="text"
                       maxLength={6}
                       value={formData.pinCode}
-                      onChange={e => setFormData({ ...formData, pinCode: e.target.value.replace(/\D/g, '') })}
+                      onChange={e => dispatch({ type: 'set-field', field: 'pinCode', value: e.target.value.replace(/\D/g, '') })}
                       placeholder="6 digits"
                       className="w-full px-3 py-2.5 text-xs border border-neutral-300 font-mono focus:outline-none focus:border-black"
                     />
@@ -195,7 +289,7 @@ export const CheckoutModal: React.FC = () => {
                     <input
                       type="text"
                       value={formData.city}
-                      onChange={e => setFormData({ ...formData, city: e.target.value })}
+                      onChange={e => dispatch({ type: 'set-field', field: 'city', value: e.target.value })}
                       placeholder="City"
                       className="w-full px-3 py-2.5 text-xs border border-neutral-300 focus:outline-none focus:border-black"
                     />
@@ -208,7 +302,7 @@ export const CheckoutModal: React.FC = () => {
                     </label>
                     <select
                       value={formData.state}
-                      onChange={e => setFormData({ ...formData, state: e.target.value })}
+                      onChange={e => dispatch({ type: 'set-field', field: 'state', value: e.target.value })}
                       className="w-full px-3 py-2.5 text-xs border border-neutral-300 bg-white focus:outline-none focus:border-black"
                     >
                       <option value="Karnataka">Karnataka</option>
@@ -232,7 +326,7 @@ export const CheckoutModal: React.FC = () => {
                   <input
                     type="text"
                     value={formData.addressLine1}
-                    onChange={e => setFormData({ ...formData, addressLine1: e.target.value })}
+                    onChange={e => dispatch({ type: 'set-field', field: 'addressLine1', value: e.target.value })}
                     placeholder="House/Flat No., Apartment, Street"
                     className="w-full px-3 py-2.5 text-xs border border-neutral-300 focus:outline-none focus:border-black"
                   />
@@ -303,7 +397,7 @@ export const CheckoutModal: React.FC = () => {
                 <div className="pt-4 flex justify-between items-center border-t border-neutral-200">
                   <button
                     type="button"
-                    onClick={() => setStep(1)}
+                    onClick={() => dispatch({ type: 'set-step', step: 1 })}
                     className="text-xs font-semibold uppercase text-neutral-600 hover:text-black inline-flex items-center gap-1"
                   >
                     <ArrowLeft className="w-3.5 h-3.5" /> Back to Address

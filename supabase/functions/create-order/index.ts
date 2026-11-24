@@ -11,6 +11,7 @@ const safeCheckoutError = (message: string) => {
     'invalid quantity',
     'product unavailable',
     'variant unavailable',
+    'color does not match variant',
     'insufficient inventory',
     'Online payments are disabled',
   ];

@@ -14,6 +14,16 @@ export const supabase: SupabaseClient | null =
       })
     : null;
 
+let passwordRecoveryEventSeen = false;
+if (supabase) {
+  supabase.auth.onAuthStateChange(event => {
+    if (event === 'PASSWORD_RECOVERY') passwordRecoveryEventSeen = true;
+    if (event === 'SIGNED_OUT') passwordRecoveryEventSeen = false;
+  });
+}
+
+export const hasPasswordRecoveryEvent = () => passwordRecoveryEventSeen;
+
 export const requireSupabase = () => {
   if (!supabase) {
     throw new Error('Supabase is not configured for this environment.');

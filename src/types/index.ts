@@ -19,8 +19,11 @@ export type ViewId =
 
 export interface ProductVariant {
   id: string;
+  productId?: string;
   name: string; // e.g., 'XS', 'S', 'M', 'L', 'XL' or '50ml', '100ml', 'Free Size'
+  colorName?: string;
   inStock: boolean;
+  availableQuantity?: number;
 }
 
 export interface ProductColor {
@@ -63,6 +66,10 @@ export interface CartItem {
   selectedColor: ProductColor;
   selectedVariant: ProductVariant;
   quantity: number;
+  regularPriceMinor?: number;
+  effectivePriceMinor?: number;
+  discountMinor?: number;
+  offerId?: string | null;
 }
 
 export interface FilterState {

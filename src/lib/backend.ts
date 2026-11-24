@@ -2,6 +2,9 @@ import { Order, Product, ShippingAddress } from '../types';
 import { PRODUCTS } from '../data/products';
 import { requireSupabase, supabase } from './supabase';
 import { isValidOrderInput, isPaymentMethod, minorUnitsToDisplay } from './security';
+import { resolveVariantIdForProduct } from './cart';
+import { normalizeOfferDiscountValue } from './pricing';
+import { getPasswordRecoveryRedirect } from './password-recovery';
 
 export type PaymentMethod = 'upi' | 'card' | 'netbanking' | 'cod';
 
@@ -27,6 +30,7 @@ interface DatabaseOrder {
 }
 
 interface DatabaseOrderItem {
+  order_id?: string;
   product_id: string;
   variant_id: string;
   product_name: string;
@@ -137,17 +141,89 @@ export interface EffectiveProductPrice {
   offerId: string | null;
 }
 
+const MAX_STOCK_VARIANT_IDS = 100;
+
+export const getVariantStock = async (variantIds: string[]): Promise<Map<string, number>> => {
+  if (!Array.isArray(variantIds) || variantIds.some(id =>
+    typeof id !== 'string' || !id.trim() || id.trim() !== id
+  )) {
+    throw new Error('Variant IDs must be non-empty strings.');
+  }
+  const ids = [...new Set(variantIds)];
+  if (ids.length > MAX_STOCK_VARIANT_IDS) {
+    throw new Error(`Stock can be checked for at most ${MAX_STOCK_VARIANT_IDS} variants at a time.`);
+  }
+  const stock = new Map(ids.map(id => [id, 0]));
+  if (ids.length === 0) return stock;
+
+  const { data, error } = await requireSupabase().rpc('get_variant_stock', { p_variant_ids: ids });
+  if (error) throw error;
+  if (!Array.isArray(data)) throw new Error('Stock response was invalid.');
+
+  for (const row of data) {
+    if (!row || typeof row.variant_id !== 'string' || !stock.has(row.variant_id) ||
+        !Number.isInteger(row.available_quantity) || row.available_quantity < 0) {
+      throw new Error('Stock response contained invalid variant data.');
+    }
+    stock.set(row.variant_id, row.available_quantity);
+  }
+  return stock;
+};
+
+export const resolvePublishedVariantId = async (
+  productId: string,
+  variant: Product['variants'][number],
+  colorName: string,
+): Promise<string | null> => {
+  const { data, error } = await requireSupabase()
+    .from('product_variants')
+    .select('id, product_id, name, color_name')
+    .eq('product_id', productId)
+    .eq('active', true);
+  if (error) throw error;
+  return resolveVariantIdForProduct(productId, variant, colorName, (data ?? []).map(row => ({
+    id: row.id,
+    productId: row.product_id,
+    name: row.name,
+    colorName: row.color_name,
+  })));
+};
+
 export const getEffectiveProductPrice = async (productId: string): Promise<EffectiveProductPrice | null> => {
   const { data, error } = await requireSupabase().rpc('effective_product_price', { p_product_id: productId });
   if (error) throw error;
   const row = Array.isArray(data) ? data[0] : data;
   if (!row) return null;
-  return {
+  const price: EffectiveProductPrice = {
     regularPriceMinor: Number(row.regular_price_minor),
     effectivePriceMinor: Number(row.effective_price_minor),
     discountMinor: Number(row.discount_minor),
     offerId: row.offer_id ?? null,
   };
+  if (![price.regularPriceMinor, price.effectivePriceMinor, price.discountMinor].every(Number.isSafeInteger) ||
+      price.regularPriceMinor < 0 || price.effectivePriceMinor < 0 ||
+      price.effectivePriceMinor > price.regularPriceMinor || price.discountMinor < 0 ||
+      price.discountMinor > price.regularPriceMinor ||
+      price.regularPriceMinor - price.effectivePriceMinor !== price.discountMinor ||
+      (price.offerId !== null && typeof price.offerId !== 'string')) {
+    throw new Error('Effective price response was invalid.');
+  }
+  return price;
+};
+
+export const getEffectiveProductPrices = async (
+  productIds: string[],
+): Promise<Map<string, EffectiveProductPrice>> => {
+  const ids = [...new Set(productIds)];
+  if (ids.some(id => typeof id !== 'string' || !id.trim())) {
+    throw new Error('Product IDs must be non-empty strings.');
+  }
+  const prices = await Promise.all(ids.map(async id => {
+    const price = await getEffectiveProductPrice(id);
+    if (!price) throw new Error(`Pricing is unavailable for product ${id}.`);
+    return [id, price] as const;
+  }));
+  return new Map(prices);
 };
 
 const requireAdmin = async () => {
@@ -289,23 +365,43 @@ export const getActiveOffers = async (): Promise<ActiveOfferRecord[]> => {
 
 export const getPublishedProducts = async (): Promise<Product[]> => {
   const client = requireSupabase();
-  const [{ data: products, error: productError }, { data: variants, error: variantError }, { data: inventory, error: inventoryError }] = await Promise.all([
+  const [{ data: products, error: productError }, { data: variants, error: variantError }] = await Promise.all([
     client.from('products').select('id, name, category, price_minor, published, primary_image, description, subcategory, featured, created_at').eq('published', true).order('created_at', { ascending: false }),
-    client.from('product_variants').select('id, product_id, name, active'),
-    client.from('inventory').select('variant_id, available_quantity'),
+    client.from('product_variants').select('id, product_id, name, color_name, active').eq('active', true),
   ]);
   if (productError) throw productError;
   if (variantError) throw variantError;
-  if (inventoryError) throw inventoryError;
-  const stock = new Map((inventory ?? []).map(item => [item.variant_id, item.available_quantity]));
+  const activeVariants = variants ?? [];
+  const stock = new Map<string, number>();
+  const variantIds = activeVariants.map(variant => variant.id);
+  for (let offset = 0; offset < variantIds.length; offset += MAX_STOCK_VARIANT_IDS) {
+    const batch = await getVariantStock(variantIds.slice(offset, offset + MAX_STOCK_VARIANT_IDS));
+    batch.forEach((quantity, variantId) => stock.set(variantId, quantity));
+  }
   return (products ?? []).map(row => {
     const existing = PRODUCTS.find(product => product.id === row.id);
-    const productVariants = (variants ?? []).filter(variant => variant.product_id === row.id && variant.active).map(variant => ({
+    const productVariants = activeVariants.filter(variant => variant.product_id === row.id).map(variant => ({
       id: variant.id,
+      productId: variant.product_id,
       name: variant.name,
+      colorName: variant.color_name,
+      availableQuantity: stock.get(variant.id) ?? 0,
       inStock: (stock.get(variant.id) ?? 0) > 0,
     }));
-    if (existing) return { ...existing, name: row.name, price: minorUnitsToDisplay(row.price_minor), primaryImage: row.primary_image, variants: productVariants.length ? productVariants : existing.variants };
+    const productColors = [...new Set(productVariants.map(variant =>
+      variant.colorName || 'Default'
+    ))].map(name => ({
+      name,
+      hex: existing?.colors.find(color => color.name === name)?.hex ?? '#e5e5e5',
+    }));
+    if (existing) return {
+      ...existing,
+      name: row.name,
+      price: minorUnitsToDisplay(row.price_minor),
+      primaryImage: row.primary_image,
+      colors: productColors,
+      variants: productVariants,
+    };
     return {
       id: row.id,
       name: row.name,
@@ -317,7 +413,7 @@ export const getPublishedProducts = async (): Promise<Product[]> => {
       primaryImage: row.primary_image,
       secondaryImage: row.primary_image,
       gallery: [row.primary_image],
-      colors: [],
+      colors: productColors,
       variants: productVariants,
       variantType: 'standard' as const,
       description: row.description,
@@ -346,16 +442,13 @@ export const saveAdminOffer = async (input: {
   if (!input.name.trim() || Number.isNaN(start.valueOf()) || Number.isNaN(end.valueOf()) || end <= start) {
     throw new Error('Offer name and a valid date range are required.');
   }
-  if (!Number.isFinite(input.discountValue) || input.discountValue <= 0 ||
-      (input.discountType === 'percentage' && input.discountValue > 100)) {
-    throw new Error('Discount must be greater than zero and percentage discounts cannot exceed 100.');
-  }
+  const storedDiscountValue = normalizeOfferDiscountValue(input.discountType, input.discountValue);
   const client = requireSupabase();
   const values = {
     name: input.name.trim(),
     description: input.description.trim(),
     discount_type: input.discountType,
-    discount_value: input.discountType === 'fixed' ? Math.round(input.discountValue * 100) : Math.round(input.discountValue),
+    discount_value: storedDiscountValue,
     starts_at: start.toISOString(),
     ends_at: end.toISOString(),
     active: input.active,
@@ -750,7 +843,11 @@ const toDeliveryAddress = (address: {
 export const getAccountData = async () => {
   const client = requireSupabase();
   const userId = await getAuthenticatedUserId();
-  const [{ data: profile, error: profileError }, { data: addresses, error: addressError }] =
+  const [
+    { data: profile, error: profileError },
+    { data: addresses, error: addressError },
+    { data: orders, error: ordersError },
+  ] =
     await Promise.all([
       client.from('profiles').select('id, full_name, phone, role').eq('id', userId).single(),
       client.from('addresses')
@@ -758,9 +855,26 @@ export const getAccountData = async () => {
         .eq('user_id', userId)
         .order('is_default', { ascending: false })
         .order('created_at', { ascending: false }),
+      client.from('orders')
+        .select('id, order_number, created_at, subtotal_minor, discount_minor, shipping_minor, total_minor, payment_method, payment_status, fulfillment_status, shipping_address')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(10),
     ]);
   if (profileError || !profile) throw profileError ?? new Error('Profile could not be loaded.');
   if (addressError) throw addressError;
+  if (ordersError) throw ordersError;
+
+  const orderIds = (orders ?? []).map(order => order.id);
+  let orderItems: DatabaseOrderItem[] = [];
+  if (orderIds.length > 0) {
+    const { data, error } = await client.from('order_items')
+      .select('order_id, product_id, variant_id, product_name, variant_name, color_name, unit_price_minor, quantity, product_snapshot')
+      .in('order_id', orderIds);
+    if (error) throw error;
+    orderItems = data ?? [];
+  }
+
   return {
     profile: {
       id: profile.id,
@@ -770,6 +884,10 @@ export const getAccountData = async () => {
       email: (await getSession()).user?.email ?? '',
     } satisfies UserProfile,
     addresses: (addresses ?? []).map(toDeliveryAddress),
+    recentOrders: (orders ?? []).map(order => toOrder(
+      order,
+      orderItems.filter(item => item.order_id === order.id),
+    )),
   };
 };
 
@@ -954,11 +1072,21 @@ export const signUp = async (input: {
 
 export const requestPasswordReset = async (email: string) => {
   const client = requireSupabase();
-  const redirectTo = import.meta.env.VITE_APP_URL as string | undefined;
+  const redirectTo = getPasswordRecoveryRedirect(
+    import.meta.env.VITE_APP_URL as string | undefined,
+    import.meta.env.PROD,
+  );
   const { error } = await client.auth.resetPasswordForEmail(email, {
-    redirectTo: redirectTo ? `${redirectTo.replace(/\/$/, '')}/reset-password` : undefined,
+    redirectTo,
   });
   if (error) throw error;
+};
+
+export const updatePassword = async (password: string) => {
+  const { data, error } = await requireSupabase().auth.updateUser({ password });
+  if (error) throw error;
+  if (!data.user) throw new Error('Your password could not be updated. Please try again.');
+  return data.user;
 };
 
 export const signOut = async () => {

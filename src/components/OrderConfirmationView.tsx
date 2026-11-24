@@ -2,6 +2,7 @@ import React from 'react';
 import { useShop } from '../context/ShopContext';
 import { CheckCircle2, Package, Truck, ArrowRight, Printer } from 'lucide-react';
 import { ImageWithFallback } from './ImageWithFallback';
+import { getOrderPresentation } from '../lib/order-presentation';
 
 export const OrderConfirmationView: React.FC = () => {
   const { latestOrder, navigateToHome, navigateToCategory } = useShop();
@@ -21,6 +22,8 @@ export const OrderConfirmationView: React.FC = () => {
     );
   }
 
+  const presentation = getOrderPresentation(latestOrder);
+
   return (
     <div className="bg-neutral-50/70 min-h-screen py-12 sm:py-20">
       <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -34,17 +37,13 @@ export const OrderConfirmationView: React.FC = () => {
               <CheckCircle2 className="w-8 h-8 stroke-[1.5]" />
             </div>
             <span className="text-[11px] font-semibold uppercase tracking-[0.25em] text-neutral-400 block mb-1">
-              {latestOrder.paymentStatus === 'pending'
-                ? 'Order Received — Payment Confirmation Pending'
-                : latestOrder.paymentStatus === 'review'
-                  ? 'Payment Review Required — We Will Contact You'
-                : 'Order Confirmed — Preparing Dispatch'}
+              {presentation.statusLabel}
             </span>
             <h1 className="font-display text-2xl sm:text-3xl font-medium text-neutral-900">
               Thank You, {latestOrder.shippingAddress.fullName}
             </h1>
             <p className="text-xs text-neutral-500 mt-2">
-              We've dispatched confirmation and tracking updates to{' '}
+              Your order receipt is saved to your account under{' '}
               <strong className="text-neutral-900">{latestOrder.shippingAddress.email}</strong>
             </p>
             <div className="mt-4 inline-flex items-center gap-2 bg-neutral-100 px-4 py-1.5 font-mono text-xs border border-neutral-200">

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useShop } from '../context/ShopContext';
 import { 
   X, 
@@ -11,6 +11,7 @@ import {
   Lock 
 } from 'lucide-react';
 import { ImageWithFallback } from './ImageWithFallback';
+import { MAX_CART_QUANTITY } from '../lib/cart';
 
 export const CartDrawer: React.FC = () => {
   const {
@@ -23,14 +24,45 @@ export const CartDrawer: React.FC = () => {
     cartShipping,
     cartDiscount,
     cartTotal,
+    cartPricingValid,
+    cartPricingError,
+    refreshCartPricing,
     appliedPromo,
     applyPromoCode,
     removePromoCode,
     setIsCheckoutOpen,
-    navigateToHome
+    navigateToHome,
+    variantStock,
+    variantStockStatus,
+    refreshVariantStock,
+    cartValidationState,
+    cartValidationError,
+    retryCartValidation,
+    addToast,
   } = useShop();
 
   const [promoInput, setPromoInput] = useState('');
+  const [isPreparingCheckout, setIsPreparingCheckout] = useState(false);
+  const cartVariantIds = useMemo(
+    () => [...new Set(cart.map(item => item.selectedVariant.id))],
+    [cart]
+  );
+  const cartVariantIdsKey = JSON.stringify(cartVariantIds);
+
+  useEffect(() => {
+    const ids = JSON.parse(cartVariantIdsKey) as string[];
+    if (!isCartOpen || cartValidationState !== 'ready' || ids.length === 0) return;
+    refreshVariantStock(ids).catch(error => {
+      console.error('Cart stock refresh failed', error);
+    });
+  }, [isCartOpen, cartValidationState, cartVariantIdsKey, refreshVariantStock]);
+
+  useEffect(() => {
+    if (!isCartOpen || cartValidationState !== 'ready' || cart.length === 0) return;
+    refreshCartPricing().catch(error => {
+      console.error('Cart pricing refresh failed', error);
+    });
+  }, [isCartOpen, cartValidationState, cartVariantIdsKey, refreshCartPricing]);
 
   if (!isCartOpen) return null;
 
@@ -44,6 +76,24 @@ export const CartDrawer: React.FC = () => {
     if (!promoInput.trim()) return;
     const success = applyPromoCode(promoInput);
     if (success) setPromoInput('');
+  };
+
+  const handleProceedToCheckout = async () => {
+    if (isPreparingCheckout) return;
+    setIsPreparingCheckout(true);
+    try {
+      if (!await refreshCartPricing()) {
+        addToast('Discount unavailable', 'Combined discounts exceed the subtotal. Remove a promotion to continue.', 'error');
+        return;
+      }
+      setIsCartOpen(false);
+      setIsCheckoutOpen(true);
+    } catch (error) {
+      console.error('Checkout pricing refresh failed', error);
+      addToast('Price check failed', 'Current prices could not be verified. Please try again.', 'error');
+    } finally {
+      setIsPreparingCheckout(false);
+    }
   };
 
   return (
@@ -116,23 +166,47 @@ export const CartDrawer: React.FC = () => {
                   <ShoppingCart className="w-8 h-8 stroke-[1.2]" />
                 </div>
                 <h3 className="font-display text-lg text-neutral-900 mb-1">
-                  Your cart is empty
+                  {cartValidationState === 'loading'
+                    ? 'Checking your saved cart'
+                    : cartValidationState === 'error'
+                      ? 'Stock check unavailable'
+                      : 'Your cart is empty'}
                 </h3>
-                <p className="text-xs text-neutral-500 max-w-xs mb-6">
-                  Explore our new-season sarees, contemporary kurtis, and artisanal fragrances.
+                <p className="text-xs text-neutral-500 max-w-xs mb-6" role={cartValidationState === 'error' ? 'alert' : undefined}>
+                  {cartValidationState === 'error'
+                    ? cartValidationError
+                    : cartValidationState === 'loading'
+                      ? 'Please wait while we verify saved item availability.'
+                      : 'Explore our new-season sarees, contemporary kurtis, and artisanal fragrances.'}
                 </p>
-                <button
-                  onClick={() => {
-                    setIsCartOpen(false);
-                    navigateToHome();
-                  }}
-                  className="px-6 py-3 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-wider hover:bg-neutral-800 transition-colors"
-                >
-                  Start Shopping
-                </button>
+                {cartValidationState === 'error' ? (
+                  <button
+                    onClick={() => { retryCartValidation().catch(error => console.error('Saved cart retry failed', error)); }}
+                    className="px-6 py-3 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-wider hover:bg-neutral-800 transition-colors"
+                  >
+                    Retry stock check
+                  </button>
+                ) : cartValidationState !== 'loading' ? (
+                  <button
+                    onClick={() => {
+                      setIsCartOpen(false);
+                      navigateToHome();
+                    }}
+                    className="px-6 py-3 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-wider hover:bg-neutral-800 transition-colors"
+                  >
+                    Start Shopping
+                  </button>
+                ) : null}
               </div>
             ) : (
-              cart.map(item => (
+              cart.map(item => {
+                const stockStatus = variantStockStatus.get(item.selectedVariant.id);
+                const available = variantStock.get(item.selectedVariant.id);
+                const canIncrease = stockStatus === 'ready' &&
+                  available !== undefined &&
+                  item.quantity < available &&
+                  item.quantity < MAX_CART_QUANTITY;
+                return (
                 <div key={item.id} className="py-4 flex gap-3 sm:gap-4 first:pt-0 last:pb-0">
                   {/* Thumbnail */}
                   <div className="w-18 sm:w-20 h-24 sm:h-26 bg-neutral-100 shrink-0 overflow-hidden relative border border-neutral-200/50">
@@ -164,6 +238,23 @@ export const CartDrawer: React.FC = () => {
                       <div className="text-[11px] text-neutral-500 mt-1 space-y-0.5">
                         <p className="truncate">Colour: {item.selectedColor.name}</p>
                         <p className="truncate">Option / Size: {item.selectedVariant.name}</p>
+                        <p aria-live="polite">
+                          {stockStatus === 'loading'
+                            ? 'Checking stock…'
+                            : stockStatus === 'error' || available === undefined
+                              ? 'Stock availability could not be verified.'
+                              : available === 0
+                                ? 'Out of stock'
+                                : `${available} available`}
+                        </p>
+                        {stockStatus === 'error' && (
+                          <button
+                            onClick={() => refreshVariantStock([item.selectedVariant.id]).catch(error => console.error('Cart stock retry failed', error))}
+                            className="text-[11px] underline"
+                          >
+                            Retry availability check
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -182,7 +273,8 @@ export const CartDrawer: React.FC = () => {
                         </span>
                         <button
                           onClick={() => updateQuantity(item.id, item.quantity + 1)}
-                          className="px-2.5 py-1 text-neutral-600 hover:text-black font-mono"
+                          disabled={!canIncrease}
+                          className="px-2.5 py-1 text-neutral-600 hover:text-black font-mono disabled:opacity-30 disabled:cursor-not-allowed"
                           aria-label="Increase quantity"
                         >
                           +
@@ -190,14 +282,22 @@ export const CartDrawer: React.FC = () => {
                       </div>
 
                       {/* Price */}
-                      <span className="font-mono text-xs font-bold text-neutral-950 tabular-nums">
-                        ₹{(item.product.price * item.quantity).toLocaleString('en-IN')}
-                      </span>
+                      <div className="text-right font-mono text-xs tabular-nums">
+                        {item.discountMinor !== undefined && item.discountMinor > 0 && (
+                          <span className="block text-neutral-400 line-through font-normal">
+                            ₹{(((item.regularPriceMinor ?? Math.round(item.product.price * 100)) * item.quantity) / 100).toLocaleString('en-IN')}
+                          </span>
+                        )}
+                        <span className="font-bold text-neutral-950">
+                          ₹{(((item.effectivePriceMinor ?? item.regularPriceMinor ?? Math.round(item.product.price * 100)) * item.quantity) / 100).toLocaleString('en-IN')}
+                        </span>
+                      </div>
                     </div>
 
                   </div>
                 </div>
-              ))
+                );
+              })
             )}
           </div>
 
@@ -258,6 +358,9 @@ export const CartDrawer: React.FC = () => {
                     </span>
                   </div>
                 )}
+                {!cartPricingValid && cartPricingError && (
+                  <p className="text-rose-700 text-[11px]" role="alert">{cartPricingError}</p>
+                )}
                 <div className="flex justify-between">
                   <span>Estimated Shipping</span>
                   <span className="tabular-nums">
@@ -278,14 +381,16 @@ export const CartDrawer: React.FC = () => {
 
               {/* Checkout CTA */}
               <button
-                onClick={() => {
-                  setIsCartOpen(false);
-                  setIsCheckoutOpen(true);
-                }}
+                onClick={handleProceedToCheckout}
+                disabled={!cart.every(item =>
+                  cartValidationState === 'ready' &&
+                  variantStockStatus.get(item.selectedVariant.id) === 'ready' &&
+                  (variantStock.get(item.selectedVariant.id) ?? 0) >= item.quantity
+                ) || !cartPricingValid || isPreparingCheckout}
                 className="w-full py-3.5 bg-neutral-950 text-white text-xs font-semibold uppercase tracking-[0.16em] hover:bg-neutral-800 transition-colors flex items-center justify-center gap-2 shadow-sm"
               >
                 <Lock className="w-3.5 h-3.5" />
-                PROCEED TO CHECKOUT
+                {isPreparingCheckout ? 'VERIFYING PRICES…' : 'PROCEED TO CHECKOUT'}
                 <ArrowRight className="w-3.5 h-3.5" />
               </button>
 
